@@ -890,9 +890,56 @@ def recommend(user_id, filter_following):
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
 
-    recommended_posts = {} 
+    liked_posts_content = query_db('''
+        SELECT p.content FROM posts p
+        JOIN reactions r ON p.id = r.post_id
+        WHERE r.user_id = ?
+    ''', (user_id,))
+    
+    if not liked_posts_content:
+        return query_db('''
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            FROM posts p
+            JOIN users u ON p.user_id = u.id
+            WHERE p.user_id != ?
+            ORDER BY p.created_at DESC
+            LIMIT 5
+        ''', (user_id,))
+    
+    word_counts = collections.Counter()
+    stop_words = {'a', 'an', 'the', 'in', 'on', 'is', 'it', 'to', 'for', 'of', 'and', 'with', 'you', 'me', 'all', 'this', 'that', 'at', 'by', 'from', 'as', 'be', 'are', 'was', 'were', 'but', 'not', 'or', 'if', 'your', 'my', 'we', 'they', 'he', 'she', 'his', 'her', 'its', 'so', 'what', 'which', 'when', 'who', 'how'}
+    
+    for post in liked_posts_content:
+        words = re.findall(r'\b\w+\b', post['content'].lower())
+        for word in words:
+            if word not in stop_words and len(word) > 2:
+                word_counts[word] += 1
+    
+    top_keywords = [word for word, _ in word_counts.most_common(10)]
+    
+    query = "SELECT p.id, p.content, p.created_at, u.username, u.id as user_id FROM posts p JOIN users u ON p.user_id = u.id"
+    params = []
+    
+    if filter_following:
+        query += " WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
+        params.append(user_id)
+    
+    all_other_posts = query_db(query, tuple(params))
+    
+    recommended_posts = []
+    liked_post_ids = {post['id'] for post in query_db('SELECT post_id as id FROM reactions WHERE user_id = ?', (user_id,))}
+    
+    for post in all_other_posts:
+        if post['id'] in liked_post_ids or post['user_id'] == user_id:
+            continue
+        
+        if any(keyword in post['content'].lower() for keyword in top_keywords):
+            recommended_posts.append(post)
+    
+    recommended_posts.sort(key=lambda p: p['created_at'], reverse=True)
+    
+    return recommended_posts[:5]
 
-    return recommended_posts;
 
 # Task 3.2
 def user_risk_analysis(user_id):
@@ -909,9 +956,87 @@ def user_risk_analysis(user_id):
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
     
-    score = 0
+    # Get user information
+    user = query_db('SELECT profile, created_at FROM users WHERE id = ?', (user_id,), one=True)
+    if not user:
+        return 0.0
+    
+    # Calculate profile score
+    profile_content = user['profile'] if user['profile'] else ""
+    _, profile_score = moderate_content(profile_content)
+    
+    # Calculate average post score
+    posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+    if posts:
+        post_scores = []
+        for post in posts:
+            _, post_score = moderate_content(post['content'])
+            post_scores.append(post_score)
+        average_post_score = sum(post_scores) / len(post_scores)
+    else:
+        average_post_score = 0.0
+    
+    # Calculate average comment score
+    comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+    if comments:
+        comment_scores = []
+        for comment in comments:
+            _, comment_score = moderate_content(comment['content'])
+            comment_scores.append(comment_score)
+        average_comment_score = sum(comment_scores) / len(comment_scores)
+    else:
+        average_comment_score = 0.0
+    
+    # Calculate weighted content risk score
+    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
+    
+    # Apply account age multiplier
+    account_created = user['created_at']
+    account_age_days = (datetime.utcnow() - account_created).days
+    
+    if account_age_days < 7:
+        user_risk_score = content_risk_score * 1.5
+    elif account_age_days < 30:
+        user_risk_score = content_risk_score * 1.2
+    else:
+        user_risk_score = content_risk_score
+    
+    # Detect rapid posting as extra risk prediction measure to keep the platform safe
+    rapid_posting_penalty = detect_rapid_posting(user_id)
+    user_risk_score += rapid_posting_penalty
+    
+    return user_risk_score
 
-    return score;
+
+def detect_rapid_posting(user_id):
+    posts_count = query_db(
+        '''SELECT COUNT(*) as count FROM posts 
+           WHERE user_id = ? 
+           AND created_at >= datetime('now', '-1 day')''',
+        (user_id,),
+        one=True
+    )
+    
+    comments_count = query_db(
+        '''SELECT COUNT(*) as count FROM comments 
+           WHERE user_id = ? 
+           AND created_at >= datetime('now', '-1 day')''',
+        (user_id,),
+        one=True
+    )
+    
+    total_recent_activity = posts_count['count'] + comments_count['count']
+    
+    if total_recent_activity > 50:
+        return 2.0
+    elif total_recent_activity > 30:
+        return 1.5
+    elif total_recent_activity > 20:
+        return 1.0
+    elif total_recent_activity > 10:
+        return 0.5
+    else:
+        return 0.0
 
     
 # Task 3.3
@@ -932,11 +1057,96 @@ def moderate_content(content):
     Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
 
-    moderated_content = content
-    score = 0
+    if not content or not isinstance(content, str):
+        return content, 0.0
     
-    return moderated_content, score
+    moderated_content = content
+    risk_score = 0.0
+    
+    # Check if any Tier 1 words are present
+    for tier1_word in TIER1_WORDS:
+        # Use word boundaries to match whole words only
+        pattern = r'\b' + re.escape(tier1_word) + r'\b'
+        if re.search(pattern, content, re.IGNORECASE):
+            return "[content removed due to severe violation]", 5.0
+    
+    # Check if any Tier 2 phrases are present
+    for tier2_phrase in TIER2_PHRASES:
+        if tier2_phrase.lower() in content.lower():
+            return "[content removed due to spam/scam policy]", 5.0
+    
+    # If content passed Tier 1 and 2, start with base score of 0.0 and check for Tier 3 words
+    tier3_violations = 0
+    for tier3_word in TIER3_WORDS:
+        pattern = r'\b' + re.escape(tier3_word) + r'\b'
+        matches = list(re.finditer(pattern, moderated_content, re.IGNORECASE))
+        
+        # Process matches in reverse order to preserve indices
+        for match in reversed(matches):
+            tier3_violations += 1
+            # Replace the matched word with censored version (asterisks)
+            asterisks = '*' * len(match.group())
+            moderated_content = (moderated_content[:match.start()] + 
+                               asterisks + 
+                               moderated_content[match.end():])
+        
+        # Add +2.0 for each Tier 3 match
+        if tier3_violations > 0:
+            risk_score += tier3_violations * 2.0
+    
+    # Detect and remove URLs/external links
+    url_pattern = url_pattern = r'\S+\.\S+'
+    url_matches = list(re.finditer(url_pattern, moderated_content, re.IGNORECASE))
+    
+    # Process URL matches in reverse to preserve indices
+    link_violations = 0
+    for match in reversed(url_matches):
+        link_violations += 1
+        moderated_content = (moderated_content[:match.start()] + 
+                           '[link removed]' + 
+                           moderated_content[match.end():])
+    
+    # Add +2.0 for each external link detected
+    if link_violations > 0:
+        risk_score += link_violations * 2.0
+    
+    # Detects excessive ALL CAPS text which is often used for spam/harassment
+    risk_score += detect_caps_spam(moderated_content)
+    
+    # Detects spam through excessive hashtag usage
+    risk_score += detect_hashtag_spam(moderated_content)
+    
+    return moderated_content, risk_score
 
+
+def detect_caps_spam(content):
+    if len(content) <= 15:
+        return 0.0
+    letter_count = 0
+    uppercase_count = 0
+    
+    for char in content:
+        if char.isalpha():
+            letter_count += 1
+            if char.isupper():
+                uppercase_count += 1
+    
+    caps_percentage = (uppercase_count / letter_count) * 100
+    if letter_count > 15 and caps_percentage > 70:
+        return 0.5
+    
+    return 0.0
+
+
+def detect_hashtag_spam(content):
+    hashtag_pattern = r'#(\w+)'
+    hashtags = re.findall(hashtag_pattern, content, re.IGNORECASE)
+    hashtag_count = len(hashtags)
+    
+    if hashtag_count > 5:
+        return hashtag_count * 0.2
+    
+    return 0.0
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)
