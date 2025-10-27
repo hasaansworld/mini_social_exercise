@@ -4,8 +4,10 @@ from gensim.models.coherencemodel import CoherenceModel
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from nltk.stem import WordNetLemmatizer
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 import nltk
 import sqlite3
+import pandas as pd
 
 def get_all_content(db_path='database.sqlite'):
     conn = sqlite3.connect(db_path)
@@ -150,10 +152,110 @@ def top_10_topics(db_path='database.sqlite'):
     print("Top 10 Topics:")
     
     # Display the topics
-    topics = []
     for idx, topic in lda_model.print_topics(num_topics=10, num_words=10):
         print(f"\nTopic {idx + 1}:")
         print(topic)
+    
+    return lda_model, dictionary, corpus
+
+def analyze_overall_sentiment(db_path='database.sqlite'):
+    # Download VADER lexicon
+    nltk.download('vader_lexicon', quiet=True)
+    
+    # Get all content
+    content_list = get_all_content(db_path)
+    print(f"\nAnalyzing sentiment for {len(content_list)} items...")
+    
+    # Initialize VADER sentiment analyzer
+    sia = SentimentIntensityAnalyzer()
+    
+    # Calculate sentiment scores for each item
+    sentiment_scores = []
+    for text in content_list:
+        if text and isinstance(text, str):
+            score = sia.polarity_scores(text)['compound']
+            sentiment_scores.append(score)
+    
+    # Create DataFrame
+    df = pd.DataFrame({'sentiment_score': sentiment_scores})
+    
+    # Categorize sentiments
+    df['sentiment_category'] = df['sentiment_score'].apply(
+        lambda x: 'Positive' if x >= 0.05 else ('Negative' if x <= -0.05 else 'Neutral')
+    )
+    
+    # Overall platform statistics
+    print("Overall Platform Sentiment:")
+    print(f"Total items analyzed: {len(df)}")
+    print(f"Average sentiment score: {df['sentiment_score'].mean():.4f}")
+    print(f"Median sentiment score: {df['sentiment_score'].median():.4f}")
+    print(f"Standard deviation: {df['sentiment_score'].std():.4f}")
+    
+    print(f"\nSentiment Distribution:")
+    sentiment_counts = df['sentiment_category'].value_counts()
+    for category in ['Positive', 'Neutral', 'Negative']:
+        count = sentiment_counts.get(category, 0)
+        percentage = (count / len(df)) * 100
+        print(f"  {category}: {count} ({percentage:.2f}%)")
+    
+    return df
+
+def analyze_sentiment_by_topic(db_path='database.sqlite', lda_model=None, 
+                                dictionary=None, corpus=None, df_sentiment=None):
+    if lda_model is None or dictionary is None or corpus is None:
+        print("Error: Need LDA model, dictionary, and corpus from topic modeling")
+        return
+    
+    if df_sentiment is None:
+        df_sentiment = analyze_overall_sentiment(db_path)
+    
+    print("\n\nSentiment Analysis by Topic:")
+    
+    # Assign dominant topic to each document
+    topic_assignments = []
+    for i, doc_bow in enumerate(corpus):
+        doc_topics = lda_model.get_document_topics(doc_bow)
+        if doc_topics:
+            dominant_topic = max(doc_topics, key=lambda x: x[1])
+            topic_assignments.append(dominant_topic[0])
+        else:
+            topic_assignments.append(-1)
+    
+    # Merge with sentiment data
+    df_sentiment_with_topics = df_sentiment.head(len(topic_assignments)).copy()
+    df_sentiment_with_topics['topic_id'] = topic_assignments
+    
+    # Filter out documents without topics
+    df_sentiment_with_topics = df_sentiment_with_topics[df_sentiment_with_topics['topic_id'] != -1]
+    
+    # Calculate sentiment percentages for each topic
+    for topic_id in sorted(df_sentiment_with_topics['topic_id'].unique()):
+        topic_data = df_sentiment_with_topics[df_sentiment_with_topics['topic_id'] == topic_id]
+        sentiment_dist = topic_data['sentiment_category'].value_counts()
+        
+        # Get topic keywords
+        topic_words = lda_model.show_topic(topic_id, topn=5)
+        words = [word for word, _ in topic_words]
+        
+        print(f"\nTopic {topic_id + 1} ({', '.join(words)}):")
+        for category in ['Positive', 'Neutral', 'Negative']:
+            count = sentiment_dist.get(category, 0)
+            percentage = (count / len(topic_data)) * 100
+            print(f"  {category}: {percentage:.1f}%")
+    
+    return df_sentiment_with_topics
 
 if __name__ == "__main__":
-    top_10_topics()
+    # Perform topic modeling
+    lda_model, dictionary, corpus = top_10_topics()
+    
+    # Perform overall sentiment analysis
+    df_sentiment = analyze_overall_sentiment()
+    
+    # Analyze sentiment by topic
+    df_sentiment_by_topic = analyze_sentiment_by_topic(
+        lda_model=lda_model,
+        dictionary=dictionary,
+        corpus=corpus,
+        df_sentiment=df_sentiment
+    )
